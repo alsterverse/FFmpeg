@@ -46,6 +46,11 @@ jobs:
         id: build
         working-directory: ffmpeg-builds
         run: |
+          set -euo pipefail
+          # The image's openapv is 1.1 or later, whose API n8.1.3's liboapv encoder does not build against (fixed on release/8.1 by 0880196367); configure takes the last of --enable/--disable, so this drops the APV encoder, which nothing here uses
+          sed -i 's/\\\$FF_CONFIGURE /\\$FF_CONFIGURE --disable-liboapv /' build.sh
+          grep -q -- '--disable-liboapv' build.sh
+
           # build.sh derives the image name from GITHUB_REPOSITORY, which must name FFmpeg-Builds for it to run the image pulled above
           GITHUB_REPOSITORY=FFmpeg-Builds/FFmpeg-Builds \
           FFMPEG_REPO_OVERRIDE="https://github.com/${{ github.repository }}.git" \
