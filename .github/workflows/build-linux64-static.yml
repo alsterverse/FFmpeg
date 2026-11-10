@@ -1,0 +1,130 @@
+# Builds a static Linux x86_64 ffmpeg and ffprobe from this repository with FFmpeg-Builds' scripts and its published linux64-lgpl-8.1 build image, and publishes the archive as a release.
+# The image holds every dependency (libvpx, libopus, libdav1d, ...) already built and the configure flags in its environment, so the job compiles only ffmpeg itself.
+# The archive keeps FFmpeg-Builds' layout, `<name>/bin/ffmpeg` and `<name>/bin/ffprobe`, so it replaces an FFmpeg-Builds `linux64-lgpl-8.1` archive as it is.
+
+name: Build static linux64 ffmpeg
+
+on:
+  push:
+    branches:
+      - release-8.1-vp9
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-linux64-static-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # FFmpeg-Builds' scripts at a fixed commit; the variant `linux64 lgpl 8.1` names the image below
+  FFMPEG_BUILDS_COMMIT: c9fe5114060e507409f7ee07edfd82efaf25d767
+  # FFmpeg-Builds deletes an image version once `latest` moves on, so a digest pin would break the next build; the digest used is recorded in the release notes instead
+  BUILD_IMAGE: ghcr.io/ffmpeg-builds/ffmpeg-builds/linux64-lgpl-8.1:latest
+
+jobs:
+  build:
+    name: Build and release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out FFmpeg-Builds
+        uses: actions/checkout@v7
+        with:
+          repository: FFmpeg-Builds/FFmpeg-Builds
+          ref: ${{ env.FFMPEG_BUILDS_COMMIT }}
+          path: ffmpeg-builds
+
+      - name: Pull build image
+        id: image
+        run: |
+          docker pull "$BUILD_IMAGE"
+          echo "digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$BUILD_IMAGE")" >> "$GITHUB_OUTPUT"
+
+      - name: Build ffmpeg
+        id: build
+        working-directory: ffmpeg-builds
+        run: |
+          # build.sh derives the image name from GITHUB_REPOSITORY, which must name FFmpeg-Builds for it to run the image pulled above
+          GITHUB_REPOSITORY=FFmpeg-Builds/FFmpeg-Builds \
+          FFMPEG_REPO_OVERRIDE="https://github.com/${{ github.repository }}.git" \
+          GIT_BRANCH_OVERRIDE="$GITHUB_REF_NAME" \
+            ./build.sh linux64 lgpl 8.1
+
+      - name: Check the built commit
+        id: version
+        env:
+          BUILD_NAME: ${{ steps.build.outputs.build_name }}
+        run: |
+          # build.sh clones the branch's head, which a later push may have moved past the commit this run belongs to
+          set -euo pipefail
+          # The build name is `ffmpeg-<git describe>-linux64-lgpl-8.1`, such as ffmpeg-n8.1.3-36-g0123456789-linux64-lgpl-8.1
+          version="$(sed -E 's/^ffmpeg-(.*)-linux64-.*$/\1/' <<< "$BUILD_NAME")"
+          built_hash="$(sed -E 's/^.*-g([0-9a-f]+)$/\1/' <<< "$version")"
+          if [[ "$version" == "$BUILD_NAME" || "$built_hash" == "$version" || "$GITHUB_SHA" != "$built_hash"* ]]; then
+            echo "::error::Built $BUILD_NAME, expected commit $GITHUB_SHA"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # The release tag is the version without its `-g<hash>`, then `vp9` and the commit, such as n8.1.3-36-vp9-0123456789
+          echo "tag=${version%-g*}-vp9-${GITHUB_SHA::10}" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test
+        env:
+          ARCHIVE: ffmpeg-builds/artifacts/${{ steps.build.outputs.build_name }}.tar.xz
+        run: |
+          set -euo pipefail
+          mkdir smoke
+
+          # The call-server image's extraction, unchanged
+          tar --extract --file "$ARCHIVE" --directory smoke --strip-components 2 --wildcards '*/bin/ffmpeg' '*/bin/ffprobe'
+          ls -l smoke
+
+          ff="docker run --rm -v $PWD/smoke:/ffmpeg:ro node:24-trixie-slim /ffmpeg/ffmpeg -hide_banner"
+          $ff -version
+          docker run --rm -v "$PWD/smoke:/ffmpeg:ro" node:24-trixie-slim /ffmpeg/ffprobe -hide_banner -version
+
+          require() {
+            local list="$1"; shift
+            local output; output="$($ff "-$list")"
+            for name in "$@"; do
+              grep -Eq "^ *[A-Z.]+ +${name} " <<< "$output" || { echo "::error::Missing from -$list: $name"; exit 1; }
+            done
+          }
+          require demuxers rtp sdp matroska,webm
+          require muxers matroska webm
+          require encoders libvpx libopus
+          require decoders libdav1d vp8 vp9 h264 opus
+          require filters amix aresample adelay color scale pad setsar setpts overlay format
+          grep -Eq '^ +udp$' <<< "$($ff -protocols)" || { echo "::error::Missing protocol: udp"; exit 1; }
+
+      - name: Publish release
+        working-directory: ffmpeg-builds/artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_NAME: ${{ steps.build.outputs.build_name }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # A release's files are never replaced: a commit that is already released fails here
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::error::Release $TAG already exists"
+            exit 1
+          fi
+
+          sha256sum "$BUILD_NAME.tar.xz" > checksums.sha256
+          cat checksums.sha256
+          {
+            echo "Static Linux x86_64 ffmpeg and ffprobe (LGPL), version ${VERSION}, built from ${GITHUB_REPOSITORY} at ${GITHUB_SHA}."
+            echo
+            echo "- FFmpeg-Builds scripts: FFmpeg-Builds/FFmpeg-Builds@${FFMPEG_BUILDS_COMMIT}, variant \`linux64 lgpl 8.1\`"
+            echo "- Build image: \`${IMAGE_DIGEST}\`"
+            echo "- Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > notes.md
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "$TAG" --notes-file notes.md \
+            "$BUILD_NAME.tar.xz" checksums.sha256
